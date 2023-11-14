@@ -8,6 +8,7 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <stdbool.h>
 #include <pthread.h>
 
 #define MAXEVENTS 64
@@ -22,7 +23,7 @@ typedef struct epoll_info
 } epoll_info;
 
 epoll_info epolls[THREAD_NUM];
-int taskQueue[256];
+int taskQueue[100000];
 int taskCount = 0;
 int sock;
 
@@ -52,23 +53,26 @@ void submitTask(int task)
 void* handleConnection(void* args)
 {
     epoll_info* epoll_in = (epoll_info*) args;
-    int epoll_fd = epoll_in->epoll_fd;
-    struct epoll_event event = epoll_in->event;
-    struct epoll_event* events = epoll_in->events;
+    bool active = true;
     for (;;) {
-        int nevents = epoll_wait(epoll_fd, events, MAXEVENTS, -1);
+        if (!active) usleep(100);
+        int nevents = epoll_wait(epoll_in->epoll_fd, epoll_in->events, MAXEVENTS, -1);
         if (nevents == -1) {
             perror("epoll_wait()");
             exit(EXIT_FAILURE);
+        } else if (nevents == 0) {
+            active = false;
+            continue;
         }
+        active = true;
         for (int i = 0; i < nevents; i++) {
-            if ((events[i].events & EPOLLERR) || (events[i].events & EPOLLHUP) ||
-                (!(events[i].events & EPOLLIN))) {
+            if ((epoll_in->events[i].events & EPOLLERR) || (epoll_in->events[i].events & EPOLLHUP) ||
+                (!(epoll_in->events[i].events & EPOLLIN))) {
                 // error case
                 fprintf(stderr, "epoll error\n");
-                close(events[i].data.fd);
+                close(epoll_in->events[i].data.fd);
                 continue;
-            } else if (events[i].data.fd == sock) {
+            } else if (epoll_in->events[i].data.fd == sock) {
                 // server socket; call accept as many times as we can
                 pthread_mutex_lock(&mutexQueue);
                 while (taskCount == 0) {
@@ -89,9 +93,9 @@ void* handleConnection(void* args)
                 } else {
                     printf("accepted new connection on fd %d\n", client);
                     set_nonblocking(client);
-                    event.data.fd = client;
-                    event.events = EPOLLIN | EPOLLET;
-                    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client, &event) == -1) {
+                    epoll_in->event.data.fd = client;
+                    epoll_in->event.events = EPOLLIN | EPOLLET;
+                    if (epoll_ctl(epoll_in->epoll_fd, EPOLL_CTL_ADD, client, &epoll_in->event) == -1) {
                         perror("epoll_ctl()");
                         exit(EXIT_FAILURE);
                     }
@@ -101,7 +105,7 @@ void* handleConnection(void* args)
                 // client socket; read as much data as we can
                 char buf[1024];
                 for (;;) {
-                    ssize_t nbytes = read(events[i].data.fd, buf, sizeof(buf));
+                    ssize_t nbytes = read(epoll_in->events[i].data.fd, buf, sizeof(buf));
                     if (nbytes == -1) {
                         if (errno == EAGAIN || errno == EWOULDBLOCK) {
                         printf("finished reading data from client\n");
@@ -111,8 +115,11 @@ void* handleConnection(void* args)
                             exit(EXIT_FAILURE);
                         }
                     } else if (nbytes == 0) {
-                        printf("finished with %d\n", events[i].data.fd);
-                        close(events[i].data.fd);
+                        printf("finished with %d\n", epoll_in->events[i].data.fd);
+                        while (true) {
+                            
+                        }
+                        close(epoll_in->events[i].data.fd);
                         break;
                     } else {
                         fwrite(buf, sizeof(char), nbytes, stdout);
@@ -183,17 +190,24 @@ int main(int argc, char **argv) {
             perror("Failed to create a thread");
         }
     }
-
+    bool active = true;
     while(1)
     {
-        printf("\n************* Waiting for new connection *************\n\n");
+        // printf("\n************* Waiting for new connection *************\n\n");
+        if (!active) usleep(100);
         int new_socket;
-        if ((new_socket = accept(sock, (struct sockaddr *)&addr, (socklen_t*)&addrlen)) < 0)
+        if ((new_socket = accept(sock, (struct sockaddr *)&addr, (socklen_t*)&addrlen)) == -1)
         {
-            perror("In accept");
-            exit(EXIT_FAILURE);
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+              // we processed all of the connections
+              active = false;
+                continue;
+            } else {
+              perror("accept()");
+              return 1;
+            }
         }
-
+        active = true;
         submitTask(new_socket);
 
     }
