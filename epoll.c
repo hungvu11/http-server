@@ -11,24 +11,21 @@
 #include <stdbool.h>
 #include <pthread.h>
 
-#define MAXEVENTS 64
-#define THREAD_NUM 4
+#define MAXEVENTS 1000
+#define THREAD_NUM 5
 #define PORT 9000
 
 typedef struct epoll_info
 {
     int epoll_fd;
-    struct epoll_event event;
     struct epoll_event* events;
 } epoll_info;
 
-epoll_info epolls[THREAD_NUM];
-int taskQueue[100000];
-int taskCount = 0;
-int sock;
+char *response = "HTTP/1.1 200 OK\r\n";
 
-pthread_mutex_t mutexQueue;
-pthread_cond_t condQueue;
+epoll_info epolls[THREAD_NUM];
+
+int sock;
 
 static void set_nonblocking(int fd) {
   int flags = fcntl(fd, F_GETFL, 0);
@@ -41,22 +38,32 @@ static void set_nonblocking(int fd) {
   }
 }
 
-
-void submitTask(int task)
+void control_epoll_event(int epoll_fd, int op, int fd, uint32_t events)
 {
-    pthread_mutex_lock(&mutexQueue);
-    taskQueue[taskCount++] = task;
-    pthread_mutex_unlock(&mutexQueue);
-    pthread_cond_signal(&condQueue);
+    if (op == EPOLL_CTL_DEL) {
+        if (epoll_ctl(epoll_fd, op, fd, NULL) < 0) {
+            perror("del event");
+            exit(EXIT_FAILURE);
+        }
+    } else {
+        struct epoll_event ev;
+        ev.events = events;
+        ev.data.fd = fd;
+        if (epoll_ctl(epoll_fd, op, fd, &ev) < 0) {
+            perror("add event");
+            exit(EXIT_FAILURE);
+        }
+    }
 }
 
 void* handleConnection(void* args)
 {
     epoll_info* epoll_in = (epoll_info*) args;
+    int fd = epoll_in->epoll_fd;
     bool active = true;
     for (;;) {
         if (!active) usleep(100);
-        int nevents = epoll_wait(epoll_in->epoll_fd, epoll_in->events, MAXEVENTS, -1);
+        int nevents = epoll_wait(fd, epoll_in->events, MAXEVENTS, -1);
         if (nevents == -1) {
             perror("epoll_wait()");
             exit(EXIT_FAILURE);
@@ -66,69 +73,59 @@ void* handleConnection(void* args)
         }
         active = true;
         for (int i = 0; i < nevents; i++) {
-            if ((epoll_in->events[i].events & EPOLLERR) || (epoll_in->events[i].events & EPOLLHUP) ||
-                (!(epoll_in->events[i].events & EPOLLIN))) {
+            
+            struct epoll_event ev = epoll_in->events[i];
+            if ((ev.events & EPOLLERR) || (ev.events & EPOLLHUP)) {
                 // error case
                 fprintf(stderr, "epoll error\n");
-                close(epoll_in->events[i].data.fd);
+                control_epoll_event(fd, EPOLL_CTL_DEL, ev.data.fd, 0);
+                close(ev.data.fd);
                 continue;
-            } else if (epoll_in->events[i].data.fd == sock) {
-                // server socket; call accept as many times as we can
-                pthread_mutex_lock(&mutexQueue);
-                while (taskCount == 0) {
-                    pthread_cond_wait(&condQueue, &mutexQueue);
-                }
-                int client = taskQueue[taskCount-1];
-                taskCount--;
-                pthread_mutex_unlock(&mutexQueue);
-
-                if (client == -1) {
-                    if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    // we processed all of the connections
-                    break;
+            } else if (ev.events & EPOLLIN) {
+                // read from client
+                char buf[1024];
+                ssize_t nbytes = read(ev.data.fd, buf, sizeof(buf));
+                if (nbytes == -1) {
+                    if (errno == EAGAIN || errno == EWOULDBLOCK) { // retry
+                        control_epoll_event(fd, EPOLL_CTL_MOD, ev.data.fd, EPOLLIN | EPOLLET);
+                    } else { // other error
+                        perror("read()");
+                        control_epoll_event(fd, EPOLL_CTL_DEL, ev.data.fd, 0);
+                        close(ev.data.fd);
+                    }
+                } else if (nbytes == 0) {
+                    printf("finished with %d\n", ev.data.fd);
+                    control_epoll_event(fd, EPOLL_CTL_DEL, ev.data.fd, 0);
+                    close(ev.data.fd);
+                    // break;
+                } else {
+                    control_epoll_event(fd, EPOLL_CTL_MOD, ev.data.fd, EPOLLOUT | EPOLLET);
+                    fwrite(buf, sizeof(char), nbytes, stdout);
+                } 
+            } else if (ev.events & EPOLLOUT) {
+                // write a response to client
+                ssize_t nbytes = send(ev.data.fd, response, sizeof(response), 0);
+                if (nbytes == -1) {
+                    if (errno == EAGAIN || errno == EWOULDBLOCK) { // retry
+                        control_epoll_event(fd, EPOLL_CTL_MOD, ev.data.fd, EPOLLOUT | EPOLLET);
                     } else {
-                        perror("accept()");
-                        exit(EXIT_FAILURE);
+                        perror("read()");
+                        control_epoll_event(fd, EPOLL_CTL_DEL, ev.data.fd, 0);
+                        close(ev.data.fd);
                     }
                 } else {
-                    printf("accepted new connection on fd %d\n", client);
-                    set_nonblocking(client);
-                    epoll_in->event.data.fd = client;
-                    epoll_in->event.events = EPOLLIN | EPOLLET;
-                    if (epoll_ctl(epoll_in->epoll_fd, EPOLL_CTL_ADD, client, &epoll_in->event) == -1) {
-                        perror("epoll_ctl()");
-                        exit(EXIT_FAILURE);
-                    }
+                    printf("finish sending response to %d\n", ev.data.fd);
+                    control_epoll_event(fd, EPOLL_CTL_MOD, ev.data.fd, EPOLLIN | EPOLLET);
                 }
-                
-            } else {
-                // client socket; read as much data as we can
-                char buf[1024];
-                for (;;) {
-                    ssize_t nbytes = read(epoll_in->events[i].data.fd, buf, sizeof(buf));
-                    if (nbytes == -1) {
-                        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                        printf("finished reading data from client\n");
-                        break;
-                        } else {
-                            perror("read()");
-                            exit(EXIT_FAILURE);
-                        }
-                    } else if (nbytes == 0) {
-                        printf("finished with %d\n", epoll_in->events[i].data.fd);
-                        while (true) {
-                            
-                        }
-                        close(epoll_in->events[i].data.fd);
-                        break;
-                    } else {
-                        fwrite(buf, sizeof(char), nbytes, stdout);
-                    }
-                }
+            } else { // somthing unexpected
+                control_epoll_event(fd, EPOLL_CTL_DEL, ev.data.fd, 0);
+                close(ev.data.fd);
             }
         }
     }
 }
+
+
 
 int main(int argc, char **argv) {
   // create the server socket
@@ -156,34 +153,23 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  // make it nonblocking, and then listen
-  set_nonblocking(sock);
-  if (listen(sock, SOMAXCONN) < 0) {
-    perror("listen()");
-    return 1;
-  }
-
-  for (int i=0; i<THREAD_NUM; i++) {
-      // create the epoll socket
-    epolls[i].epoll_fd = epoll_create1(0);
-    if (epolls[i].epoll_fd == -1) {
-        perror("epoll_create1()");
+    // make it nonblocking, and then listen
+    set_nonblocking(sock);
+    if (listen(sock, SOMAXCONN) < 0) {
+        perror("listen()");
         return 1;
     }
 
-    // mark the server socket for reading, and become edge-triggered
-    memset(&epolls[i].event, 0, sizeof(epolls[i].event));
-    epolls[i].event.data.fd = sock;
-    epolls[i].event.events = EPOLLIN | EPOLLET;
-    if (epoll_ctl(epolls[i].epoll_fd, EPOLL_CTL_ADD, sock, &epolls[i].event) == -1) {
-        perror("epoll_ctl()");
-        return 1;
+    for (int i=0; i<THREAD_NUM; i++) {
+        // create the epoll socket
+        epolls[i].epoll_fd = epoll_create1(0);
+        if (epolls[i].epoll_fd == -1) {
+            perror("epoll_create1()");
+            return 1;
+        }
+        epolls[i].events = calloc(MAXEVENTS, sizeof(struct epoll_event));
     }
 
-    epolls[i].events = calloc(MAXEVENTS, sizeof(epolls[i].event));
-  }
-
-    pthread_mutex_init(&mutexQueue, NULL);
     pthread_t th[THREAD_NUM];
     for (int i = 0; i < THREAD_NUM; i++) {
         if (pthread_create(&th[i], NULL, &handleConnection, (void *) &epolls[i]) != 0) {
@@ -191,9 +177,10 @@ int main(int argc, char **argv) {
         }
     }
     bool active = true;
+    int current_index = 0;
     while(1)
     {
-        // printf("\n************* Waiting for new connection *************\n\n");
+        // listener
         if (!active) usleep(100);
         int new_socket;
         if ((new_socket = accept(sock, (struct sockaddr *)&addr, (socklen_t*)&addrlen)) == -1)
@@ -208,8 +195,12 @@ int main(int argc, char **argv) {
             }
         }
         active = true;
-        submitTask(new_socket);
-
+        // distribute the connection to different thread
+        set_nonblocking(new_socket);
+        control_epoll_event(epolls[current_index].epoll_fd, EPOLL_CTL_ADD, new_socket, EPOLLIN | EPOLLET);
+        
+        current_index++;
+        if (current_index == THREAD_NUM) current_index = 0;
     }
     
     for (int i = 0; i < THREAD_NUM; i++) {
@@ -217,7 +208,7 @@ int main(int argc, char **argv) {
             perror("Failed to join the thread");
         }
     }
-    pthread_mutex_destroy(&mutexQueue);
+
     close(sock);
     return 0;
 }
