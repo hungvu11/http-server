@@ -11,7 +11,7 @@
 #include <stdbool.h>
 #include <pthread.h>
 
-#define MAXEVENTS 1000
+#define MAXEVENTS 10000
 #define THREAD_NUM 5
 #define PORT 9000
 
@@ -21,7 +21,7 @@ typedef struct epoll_info
     struct epoll_event* events;
 } epoll_info;
 
-char *response = "HTTP/1.1 200 OK\r\n";
+char response[78] = "HTTP/1.1 200 OK\r\nContent-Length: 13\r\nContent-Type: text/plain\r\n\r\nHello, world";
 
 epoll_info epolls[THREAD_NUM];
 
@@ -61,6 +61,7 @@ void* handleConnection(void* args)
     epoll_info* epoll_in = (epoll_info*) args;
     int fd = epoll_in->epoll_fd;
     bool active = true;
+    // printf("current fd %d\n", fd);
     for (;;) {
         if (!active) usleep(100);
         int nevents = epoll_wait(fd, epoll_in->events, MAXEVENTS, -1);
@@ -77,14 +78,13 @@ void* handleConnection(void* args)
             struct epoll_event ev = epoll_in->events[i];
             if ((ev.events & EPOLLERR) || (ev.events & EPOLLHUP)) {
                 // error case
-                fprintf(stderr, "epoll error\n");
+                // perror("epoll error");
                 control_epoll_event(fd, EPOLL_CTL_DEL, ev.data.fd, 0);
                 close(ev.data.fd);
-                continue;
             } else if (ev.events & EPOLLIN) {
                 // read from client
-                char buf[1024];
-                ssize_t nbytes = read(ev.data.fd, buf, sizeof(buf));
+                char buf[4096];
+                ssize_t nbytes = recv(ev.data.fd, buf, sizeof(buf), 0);
                 if (nbytes == -1) {
                     if (errno == EAGAIN || errno == EWOULDBLOCK) { // retry
                         control_epoll_event(fd, EPOLL_CTL_MOD, ev.data.fd, EPOLLIN | EPOLLET);
@@ -93,18 +93,22 @@ void* handleConnection(void* args)
                         control_epoll_event(fd, EPOLL_CTL_DEL, ev.data.fd, 0);
                         close(ev.data.fd);
                     }
-                } else if (nbytes == 0) {
-                    printf("finished with %d\n", ev.data.fd);
+                } else if (nbytes == 0) { // close connection
+                    // printf("finished with %d\n", ev.data.fd);
                     control_epoll_event(fd, EPOLL_CTL_DEL, ev.data.fd, 0);
                     close(ev.data.fd);
                     // break;
-                } else {
+                } else { // fully receive the message
                     control_epoll_event(fd, EPOLL_CTL_MOD, ev.data.fd, EPOLLOUT | EPOLLET);
-                    fwrite(buf, sizeof(char), nbytes, stdout);
+                    // fwrite(buf, sizeof(char), nbytes, stdout);
                 } 
             } else if (ev.events & EPOLLOUT) {
                 // write a response to client
+                int send_length = 0;
+                int total_length = sizeof(response);
+                
                 ssize_t nbytes = send(ev.data.fd, response, sizeof(response), 0);
+                // fwrite(response, sizeof(char), nbytes, stdout);
                 if (nbytes == -1) {
                     if (errno == EAGAIN || errno == EWOULDBLOCK) { // retry
                         control_epoll_event(fd, EPOLL_CTL_MOD, ev.data.fd, EPOLLOUT | EPOLLET);
@@ -114,9 +118,10 @@ void* handleConnection(void* args)
                         close(ev.data.fd);
                     }
                 } else {
-                    printf("finish sending response to %d\n", ev.data.fd);
+                    // printf("finish sending response to %d with length %ld\n", ev.data.fd, nbytes);
                     control_epoll_event(fd, EPOLL_CTL_MOD, ev.data.fd, EPOLLIN | EPOLLET);
                 }
+                
             } else { // somthing unexpected
                 control_epoll_event(fd, EPOLL_CTL_DEL, ev.data.fd, 0);
                 close(ev.data.fd);
@@ -185,14 +190,8 @@ int main(int argc, char **argv) {
         int new_socket;
         if ((new_socket = accept(sock, (struct sockaddr *)&addr, (socklen_t*)&addrlen)) == -1)
         {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-              // we processed all of the connections
-              active = false;
+                active = false;
                 continue;
-            } else {
-              perror("accept()");
-              return 1;
-            }
         }
         active = true;
         // distribute the connection to different thread
@@ -208,7 +207,9 @@ int main(int argc, char **argv) {
             perror("Failed to join the thread");
         }
     }
-
+    for (int i=0; i<THREAD_NUM; i++) {
+        close(epolls[i].epoll_fd);
+    }
     close(sock);
     return 0;
 }
